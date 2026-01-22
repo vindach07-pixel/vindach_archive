@@ -1,3 +1,333 @@
+"""
+ХРОНИКЁР v0.2 - Персональный архив Мисс Виндач
+Сочетает: сбор артефактов + гибридные уведомления + академический ассистент
+"""
+
+import os, json, uuid, asyncio, logging
+from datetime import datetime, timedelta
+from typing import Optional
+from random import choice, randint
+
+import supabase
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import httpx
+
+# === НАСТРОЙКА ЛОГГИРОВАНИЯ ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("chronicler")
+
+# === 1. ЗАГРУЗКА КОНФИГУРАЦИИ ===
+try:
+    with open('secrets.json') as f:
+        SECRETS = json.load(f)
+except FileNotFoundError:
+    SECRETS = {
+        "SUPABASE_URL": os.getenv("SUPABASE_URL"),
+        "SUPABASE_KEY": os.getenv("SUPABASE_KEY"),
+        "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
+        "TIMEZONE": os.getenv("TIMEZONE", "Asia/Krasnoyarsk"),
+        "CHAT_ID": os.getenv("CHAT_ID", "")
+    }
+
+SUPABASE_URL = SECRETS['SUPABASE_URL']
+SUPABASE_KEY = SECRETS['SUPABASE_KEY']
+TELEGRAM_TOKEN = SECRETS['TELEGRAM_TOKEN']
+TIMEZONE = SECRETS['TIMEZONE']
+CHAT_ID = SECRETS['CHAT_ID']
+DEEPSEEK_API_KEY = SECRETS.get('DEEPSEEK_API_KEY') or os.getenv('DEEPSEEK_API_KEY')
+
+# Проверка обязательных переменных
+if not all([SUPABASE_URL, SUPABASE_KEY, TELEGRAM_TOKEN]):
+    logger.error("Отсутствуют обязательные переменные в secrets.json")
+    raise ValueError("Заполните secrets.json или переменные окружения")
+
+# === 2. ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ===
+supabase_client = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
+telegram_bot = Bot(token=TELEGRAM_TOKEN)
+app = FastAPI(title="Хроникёр Мисс Виндач")
+
+# === 3. МОДЕЛИ ДАННЫХ ===
+class Artifact(BaseModel):
+    url: str = ""
+    title: str
+    description: str
+    type: str = "screenshot"
+    content: str = ""
+    captured_at: Optional[str] = None
+
+class StudyMaterial(BaseModel):
+    subject: str
+    topic: str
+    content: str
+    deadline: Optional[str] = None
+    priority: int = 1
+
+# === 4. ВОПРОСЫ ДЛЯ СЛУЧАЙНЫХ УВЕДОМЛЕНИЙ ===
+DAILY_QUESTIONS = [
+    "Где сейчас находится ваше внимание?",
+    "Что ваше тело просит прямо сейчас?",
+    "Какой микро-ритуал сегодня принёс вам покой?",
+    "От чего вы сегодня отказались?",
+    "Что вы поняли сегодня о себе?",
+    "Чего вы избегаете чувствовать в этот момент?",
+    "Какой цвет ближе всего к вашему настроению?",
+    "Что сейчас кажется самым хрупким?",
+]
+
+# === 5. БАЗОВЫЕ ЭНДПОИНТЫ ===
+@app.get("/")
+async def root():
+    return {
+        "service": "Хроникёр v0.2",
+        "operator": "Мисс Виндач",
+        "status": "online",
+        "time": datetime.now().isoformat()
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+# === 6. АРТЕФАКТЫ ===
+@app.post("/api/artifact")
+async def save_artifact(artifact: Artifact):
+    """Сохраняет артефакт из расширения браузера"""
+    try:
+        artifact_id = str(uuid.uuid4())
+        captured_at = artifact.captured_at or datetime.now().isoformat()
+        
+        artifact_data = {
+            "id": artifact_id,
+            "url": artifact.url,
+            "title": artifact.title[:200],
+            "description": artifact.description[:1000],
+            "type": artifact.type,
+            "content": artifact.content[:5000],
+            "captured_at": captured_at,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        response = supabase_client.table('artifacts').insert(artifact_data).execute()
+        
+        # Если известен chat_id, отправляем уведомление
+        if CHAT_ID:
+            await telegram_bot.send_message(
+                chat_id=CHAT_ID,
+text=f"📥 Сохранён артефакт: '{artifact.title}'"
+            )
+        
+        return {"status": "success", "id": artifact_id, "message": "Артефакт сохранён"}
+        
+    except Exception as e:
+        logger.error(f"Ошибка сохранения артефакта: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/artifacts")
+async def list_artifacts(limit: int = 20):
+    """Получить последние артефакты"""
+    try:
+        response = supabase_client.table('artifacts') \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+        return {"artifacts": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# === 7. УЧЕБНЫЙ МОДУЛЬ ===
+@app.post("/api/study")
+async def add_study_material(material: StudyMaterial):
+    """Добавить учебный материал"""
+    try:
+        material_id = str(uuid.uuid4())
+        material_data = {
+            "id": material_id,
+            "subject": material.subject,
+            "topic": material.topic,
+            "content": material.content,
+            "deadline": material.deadline,
+            "priority": material.priority,
+            "created_at": datetime.now().isoformat(),
+            "status": "pending"
+        }
+        
+        supabase_client.table('study_materials').insert(material_data).execute()
+        
+        return {"status": "success", "id": material_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# === 8. ФУНКЦИИ УВЕДОМЛЕНИЙ ===
+async def send_random_daily_question():
+    """Отправляет случайный вопрос в случайное время дня"""
+    if not CHAT_ID:
+        logger.warning("CHAT_ID не установлен, пропускаю уведомление")
+        return
+    
+    try:
+        question = choice(DAILY_QUESTIONS)
+        
+        # С вероятностью 40% прикрепляем старый артефакт
+        if randint(1, 100) <= 40:
+            try:
+                old_artifact = supabase_client.table('artifacts') \
+                    .select("title, created_at") \
+                    .order("created_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                if old_artifact.data:
+                    artifact = old_artifact.data[0]
+                    created = artifact['created_at'][:10]
+                    question += f"\n\n📜 Напоминание из архива ({created}):\n\"{artifact['title']}\""
+            except Exception as e:
+                logger.error(f"Ошибка получения артефакта: {e}")
+        
+        await telegram_bot.send_message(chat_id=CHAT_ID, text=f"Хроникёр: {question}")
+        logger.info(f"Отправлен ежедневный вопрос: {question[:50]}...")
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки ежедневного вопроса: {e}")
+
+async def send_weekly_summary():
+    """Воскресный отчёт за неделю"""
+    if not CHAT_ID:
+        return
+    
+    try:
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        
+        artifacts = supabase_client.table('artifacts') \
+            .select("title, type, created_at") \
+            .gte("created_at", week_ago) \
+            .execute()
+        
+        count = len(artifacts.data)
+        
+        summary = (
+            f"📊 Еженедельный отчёт Хроникёра\n"
+            f"Период: последние 7 дней\n"
+            f"Артефактов сохранено: {count}\n\n"
+            f"Самый свежий артефакт: \"{artifacts.data[0]['title'] if artifacts.data else 'нет данных'}\"\n\n"
+            f"Что вы замечаете в этих данных?"
+        )
+        
+        await telegram_bot.send_message(chat_id=CHAT_ID, text=summary, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Ошибка формирования недельного отчёта: {e}")
+
+# === 9. НАСТРОЙКА ПЛАНИРОВЩИКА ===
+def setup_scheduler():
+    """Настраивает планировщик уведомлений"""
+    try:
+        scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+        
+        # Случайное время каждый день между 10:00 и 22:00
+        scheduler.add_job(
+            send_random_daily_question,
+            trigger=CronTrigger(hour=randint(10, 22), minute=randint(0, 59)),
+            id="daily_random",
+            replace_existing=True
+        )
+        
+        # Воскресенье в 21:00
+        scheduler.add_job(
+            send_weekly_summary,
+            trigger=CronTrigger(day_of_week='sun', hour=21, minute=0),
+            id="weekly_summary",
+            replace_existing=True
+        )
+        
+        scheduler.start()
+        logger.info("Планировщик уведомлений запущен")
+        return scheduler
+    except Exception as e:
+        logger.error(f"Ошибка запуска планировщика: {e}")
+        return None
+
+# === 10. ТЕЛЕГРАМ-БОТ ===
+async def handle_telegram_message(update: Update, context):
+    """Обрабатывает сообщения от Мисс Виндач"""
+    try:
+        chat_id = update.effective_chat.id
+        text = update.message.text
+        
+        # Сохраняем в базу
+        message_data = {
+            "id": str(uuid.uuid4()),
+            "user_id": str(chat_id),
+            "text": text,
+            "timestamp": datetime.now().isoformat(),
+            "source": "telegram"
+        }
+        
+        supabase_client.table("chronicle_messages").insert(message_data).execute()
+        
+        # Отправляем запрос к DeepSeek API
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Ты — Хроникёр, цифровой архив и союзник Мисс Виндач. Отвечай в её стиле."
+                        },
+                        {"role": "user", "content": text}
+                    ],
+                    "max_tokens": 500,
+                    "temperature": 0.7
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                reply = response.json()["choices"][0]["message"]["content"]
+                await update.message.reply_text(reply)
+                
+                # Сохраняем ответ
+                reply_data = message_data.copy()
+                reply_data["id"] = str(uuid.uuid4())
+                reply_data["text"] = reply
+                reply_data["is_bot"] = True
+                supabase_client.table("chronicle_messages").insert(reply_data).execute()
+                
+            else:
+                await update.message.reply_text(f"Ошибка API: {response.status_code}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка обработки сообщения: {e}")
+        await update.message.reply_text(f"Произошла ошибка: {str(e)[:100]}")
+
+async def start_command(update: Update, context):
+    """Обработчик команды /start"""
+    chat_id = update.effective_chat.id
+    welcome_text = (
+        "Привет, Мисс Виндач. Я — Хроникёр, ваш цифровой архив.\n"
+        "Я буду сохранять наши диалоги, напоминать о важном и помогать с учёбой.\n"
+        "Просто напишите мне что-нибудь."
+    )
+    await update.message.reply_text(welcome_text)
+    
+    # Сохраняем chat_id если он ещё не сохранён
+    global CHAT_ID
+    if not CHAT_ID:
+        CHAT_ID = str(chat_id)
+        logger.info(f"Сохранили CHAT_ID: {CHAT_ID}")
+
+def setup_telegram_bot():
+    """Настраивает Telegram-бота"""
 try:
         application = Application.builder().token(TELEGRAM_TOKEN).build()
         
